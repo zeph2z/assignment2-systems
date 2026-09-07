@@ -113,6 +113,58 @@ def benchmark(args):
         print(f"average forward & backward w/ optimizer time = {statistics.mean(times)}")
         print(f"stdev forward & backward w/ optimizer time = {statistics.stdev(times)}")
 
+pytorch_attention_benchmark_config = {
+    "d_model": [16, 32, 64, 128],
+    "seq_len": [256, 1024, 4096, 8192, 16384]
+}
+
+def bench_pytorch_attention(batch_size, compiled=True):
+    warmup = 15
+    steps = 100
+
+    if compiled:
+        compiled_sdpa = torch.compile(model.scaled_dot_product_attention)
+
+    for d_model in pytorch_attention_benchmark_config["d_model"]:
+        for seq_len in pytorch_attention_benchmark_config["seq_len"]:
+            try:
+                forward_times = []
+                backward_times = []
+                gmems = []
+                for step in tqdm(range(warmup + steps)):
+
+                    Q = torch.rand(batch_size, seq_len, d_model, requires_grad=True).cuda()
+                    K = torch.rand(batch_size, seq_len, d_model, requires_grad=True).cuda()
+                    V = torch.rand(batch_size, seq_len, d_model, requires_grad=True).cuda()
+
+                    t0 = timeit.default_timer()
+                    if compiled:
+                        out = compiled_sdpa(Q, K, V)
+                    else:
+                        out = model.scaled_dot_product_attention(Q, K, V)
+                    torch.cuda.synchronize()
+                    t1 = timeit.default_timer()
+
+                    if step >= warmup:
+                        forward_times.append(t1 - t0)
+                        gmems.append(torch.cuda.memory_allocated())
+
+                    t0 = timeit.default_timer()
+                    out.sum().backward()
+                    torch.cuda.synchronize()
+                    t1 = timeit.default_timer()
+
+                    if step >= warmup:
+                        backward_times.append(t1 - t0)
+
+                print(f"d_model={d_model}, seq_len={seq_len}: forward mean={statistics.mean(forward_times)}, stdev={statistics.stdev(forward_times)}; \
+backward mean={statistics.mean(backward_times)}, stdev={statistics.stdev(backward_times)}; \
+gmem mean={statistics.mean(gmems)}, stdev={statistics.stdev(gmems)}")
+
+            except (torch.AcceleratorError, torch.OutOfMemoryError):
+                print(f"d_model={d_model}, seq_len={seq_len}: cudaOOMError")
+                torch.cuda.empty_cache()
+                continue
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="benchmark")
@@ -126,4 +178,5 @@ if __name__ == "__main__":
     parser.add_argument("--mixed-precision", action="store_true")  # 开关，不用传值
     args = parser.parse_args()
 
-    benchmark(args)
+    # benchmark(args)
+    bench_pytorch_attention(batch_size=8)
