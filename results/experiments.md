@@ -166,3 +166,32 @@ uv run nsys profile -o results/report6_measure --trace=cuda,cuDNN,cublas,nvtx --
 - forward 快的原因：matmul 走 cuBLAS（`ampere_sgemm_128x128_*`，8 步 × forward 2 个 matmul = 16 次），fusion 消除了中间矩阵多次 HBM 往返。
 - 候选语义（未完全钉死）：`scatter_zeros` = softmax 链中 `x − max(x)` 的 max 节点 backward（梯度 scatter 到每行最大值位置 + 输出置零，产物是 ~2.1GB 近全零张量）；`add_div` = dS 的 `÷√d_k` 缩放（+ 融合的加法）。疑点：每步出现 ~2.75 次（max backward 理论每步 1 次）。验证手段（未做）：`TORCH_LOGS=output_code` 看生成源码，或将 softmax 换成 `torch.softmax` 对照。
 - gmem 不变的解释：inductor 只融合 kernel、不做 backward 重算——grad_fn 为 backward 保存的 S/P 等中间张量照旧落在 HBM。compile 不是 FA2，省不了这份显存。
+
+## §4.2(b) torch.compile 全模型端到端对比（small, ctx=512, batch=8, fp32, 5 warmup + 10 steps）
+
+跑法：`uv run python answer/benchmark.py --mode <m> [--compile]`（`torch.compile` 包整个 `BasicsTransformerLM`，编译一次三模式共用；optimizer 的 `AdamW.step()` 未编译）
+
+| 模式 | vanilla (s) | compiled (s) | 加速比 |
+|---|---|---|---|
+| forward | 0.1983 ± 0.0022 | 0.1523 ± 0.0021 | 1.30× |
+| backward | 7.855 ± 2.221 | 0.477 ± 0.011 | **16.5×** |
+| optimizer 全步 | 13.039 ± 0.636 | 4.836 ± 0.825 | 2.70× |
+
+- **backward 是最大收益点**：16.5× 加速，且 stdev 从 28% 降到 2.4%（不仅快、还稳定）。对照 §2.1.3 记录：small **batch=4** 时 vanilla backward 仅 0.31s → **batch=8 变 7.86s（×25，远超线性）** → 强烈提示 batch=8 时 backward 峰值显存逼近 8GB 边缘，触发 WDDM 换页/碎片抖动（stdev 2.2s 是证据）；compile 融合减少中间激活后恢复稳定（0.48s）。
+- **optimizer 模式只快 2.7×**：该模式耗时大头是 `AdamW.step()`（≈5s，未被 compile 覆盖，仍是逐参数 elementwise/reduce）；compile 省下的主要是 backward 部分（7.9s→0.48s），forward 端仅 0.2s。拆分：vanilla 13.04 ≈ fwd 0.20 + bwd 7.86 + step ~5.0；compiled 4.84 ≈ fwd 0.15 + bwd 0.48 + step ~4.2。
+- **forward 只快 23%**：全模型融合收益被 embedding / RMSNorm / softmax / cross-entropy 等摊薄，远小于 §4.2(a) 单 attention 层的收益（融合只集中影响 attention 内部）。
+
+**§4.2(b) 显存验证（batch=8, backward 峰值，`reset_peak_memory_stats` 后测 `max_memory_allocated`）**：
+
+| | vanilla | compiled |
+|---|---|---|
+| backward 峰值 | ~8,235MB（7.67GB，每步 8232~8235MB 波动） | ~6,698MB（6.24GB，稳定） |
+
+- vanilla 峰值 7.67GB > 实际可用（8GB − 桌面 ~0.4GB ≈ 7.6GB）→ 溢出到系统内存（WDDM 换页）→ 6.5~7.9s + 每步峰值随机波动；compile 峰值 6.24GB、留 ~1.4GB 余量 → 0.48~0.58s 稳定。
+- **结论**：§4.2(b) 的 16.5× backward 加速主因是 compile 把 backward 峰值压低 ~1.43GB、消除换页，而非单纯 kernel 更快。forward 后驻留 6.86GB（两版相同，compile 不省 saved activations）。
+- 与 §4.2(a) 矛盾点：d=16, N=8192 时 compile backward 反而慢 2.7×——那里 inductor 生成了 45× 带宽浪费的 pointwise kernel（scatter_zeros/add_div）掩盖了收益；全模型 small 场景未触发这类烂 kernel，纯赚峰值下降的好处。
+
+> TODO：分析段待补，引导问题见下——写完贴给我 review。
+> 1. 为什么 vanilla backward 从 batch=4 的 0.31s 到 batch=8 的 7.86s（×25）？怎么验证是显存边缘效应而非算力？（提示：`torch.cuda.memory_allocated()`/`max_memory_allocated()` 在 backward 前后、或 nvidia-smi 观察）
+> 2. optimizer 模式为什么只快 2.7×？哪个部分没被 compile 覆盖、占了总时间大头？（对照 §2.1.4 的 matmul 占比结论）
+> 3. 本节的 backward 加速（16.5×）和 §4.2(a) 里 d=16, N=8192 的 backward 变慢（2.7×）矛盾吗？为什么全模型场景反而稳定受益？
